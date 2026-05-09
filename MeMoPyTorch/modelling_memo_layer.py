@@ -196,7 +196,7 @@ class CompositionOp(Enum):
 
 class MeMoLayer(Module):
     
-    def __init__(self, inner_dim, num_of_heads, init_weights=True, is_last=False, alpha=1, compositionOp=CompositionOp.JLT, **kwargs):
+    def __init__(self, inner_dim, num_of_heads, init_weights=True, is_last=False, alpha=1, compositionOp=CompositionOp.JLT, num_mixing_sources: Optional[int] = None, **kwargs):
         super().__init__()
 
         self.alpha = alpha # Computed vs. memorized sequence encoding (alpha = 1 only computed)
@@ -205,6 +205,10 @@ class MeMoLayer(Module):
         self.d_k = self.d // self.h
         if self.d / self.h != self.d_k:
             raise MeMoException("Inner dimension " + str(self.d) + " should be divisible for number of heads " + str(self.h))
+        if num_mixing_sources is not None:
+            self.layer_mixing_logits = Parameter(torch.zeros(num_mixing_sources))
+        else:
+            self.layer_mixing_logits = None
 
         self.W_v_single_head = ProjectionTokens(self.d, self.d_k, init_weights=init_weights)
         self.use_local_CMM = (alpha < 1)
@@ -378,6 +382,7 @@ class MeMoLayer(Module):
                  use_cache: Optional[bool] = None,
                  output_hidden_token: Optional[bool] = None, #output_attentions: Optional[bool] = None,
                  cache_position: Optional[Union[Cache, torch.Tensor]] = None,
+                 previous_hidden_states: Optional[List[torch.Tensor]] = None,
         ):
         
         #(batch_size, blocks, _, _) = input_sequence.shape
@@ -404,9 +409,42 @@ class MeMoLayer(Module):
         #return retrieved_sequence_encoding, seq_enc_per_token[:, -1].reshape(batch_size,self.d)#, locally_predicted
         #return sequence_encoding, seq_enc_per_token[:, -1].reshape(batch_size,self.d)#, locally_predicted
         if self.use_local_CMM:
-            return self.alpha*sequence_encoding+(1-self.alpha)*retrieved_sequence_encoding, seq_enc_per_token[:, -1].reshape(batch_size,self.d)#, locally_predicted
+            current_hidden = self.alpha * sequence_encoding + (1 - self.alpha) * retrieved_sequence_encoding
         else:
-             return sequence_encoding, seq_enc_per_token[:, -1].reshape(batch_size,self.d)#, locally_predicted
+             current_hidden = sequence_encoding
+             
+        current_last = current_hidden[:, -1, :]
+
+        if previous_hidden_states is not None and len(previous_hidden_states) > 0:
+            states_to_mix = []
+
+            for state in previous_hidden_states:
+                if state.dim() == 4:
+                    states_to_mix.append(state[:, -1, -1, :])
+                elif state.dim() == 3:
+                    states_to_mix.append(state[:, -1, :])
+                elif state.dim() == 2:
+                    states_to_mix.append(state)
+                else:
+                    raise ValueError("Incorrect shape!", {state.shape})
+
+            states_to_mix.append(current_last)
+
+            if self.layer_mixing_logits is None:
+                raise ValueError("layer_mixing_logits is not initialized.")
+        
+            mixing_logits = self.layer_mixing_logits[:len(states_to_mix)]
+
+            mixing_weights = torch.softmax(mixing_logits, dim=0)
+
+            mixed_hidden = torch.zeros_like(current_last)
+
+            for weight, state in zip(mixing_weights, states_to_mix):
+                mixed_hidden = mixed_hidden + weight * state
+
+            current_last = mixed_hidden
+
+        return current_hidden, current_last
 
     def directly_retrieve(self,vector):
         return self.CMM(vector)
