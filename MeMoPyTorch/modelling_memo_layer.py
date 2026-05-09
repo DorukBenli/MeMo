@@ -352,7 +352,7 @@ class MeMoLayer(Module):
         if DEBUGGING: 
             print(f"seq_enc_plus_out : {seq_enc_per_token.shape} {torch.transpose(seq_enc_per_token,-2,-1).shape} +  {output_symbols.shape}")
             
-        seq_enc_plus_out = torch.matmul(torch.transpose(sequence_encoding,-2,-1), output_symbols)
+        seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols)
         ## Key (sequenze di h token) x Value ==> matrice??
         #self.CMM_OUT.memorize(seq_enc_plus_out)
 
@@ -374,7 +374,7 @@ class MeMoLayer(Module):
 
 
         #### To be adjusted for taking into consideration the entire sequence
-        seq_enc_plus_out = torch.matmul(torch.transpose(sequence_encoding,-2,-1), output_symbols)
+        seq_enc_plus_out = torch.matmul(torch.transpose(seq_enc_per_token,-2,-1), output_symbols)
         ## Key (sequenze di h token) x Value ==> matrice??
         return sequence_encoding, seq_enc_plus_out
 
@@ -397,7 +397,7 @@ class MeMoLayer(Module):
         else:
             current_hidden = sequence_encoding
 
-        return current_hidden, current_hidden[:, -1, :]
+        return current_hidden, seq_enc_per_token[:, -1]
 
     def directly_retrieve(self,vector):
         return self.CMM(vector)
