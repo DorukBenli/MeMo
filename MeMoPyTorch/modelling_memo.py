@@ -13,7 +13,7 @@ from .modelling_memo_exception import MeMoException
 import math
 
 
-
+#TODO: check the code where we call this!
 DEBUGGING = False
 
 VERBOSE = False
