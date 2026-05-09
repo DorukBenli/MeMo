@@ -37,7 +37,7 @@ class MeMo(Module):
         self.device = device if device is not None else DEVICE
         
         self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, device=self.device)
-        self.layers = ModuleList([MeMoLayer(self.d, self.h, alpha=alpha_gen, compositionOp = compositionOp, is_last=(i +1 == num_of_layers)) for i in range(num_of_layers)])
+        self.layers = ModuleList([MeMoLayer(self.d, self.h, alpha=alpha_gen, compositionOp=compositionOp, is_last=(i + 1 == num_of_layers), num_mixing_sources=i + 1) for i in range(num_of_layers)])
 
         self.to(self.device)
     
@@ -162,11 +162,16 @@ class MeMo(Module):
         #if len(input_sequence) > current_length:
         #    input_sequence = input_sequence[len(input_sequence)-current_length:len(input_sequence)]
         
+        hidden_states = []
         for layer_level in range(self.l):
             current_length = int(current_length/self.h)
             input_sequence = input_sequence.reshape((batch_size, current_length, self.h, self.d))
-            
-            input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].retrieve(input_sequence)
+
+            input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].retrieve(
+                input_sequence,
+                previous_hidden_states=hidden_states
+            )
+            hidden_states.append(input_sequence)
             encoding_for_the_last_layer += seq_encoding_for_the_last_layer
 
 
