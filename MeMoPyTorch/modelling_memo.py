@@ -13,7 +13,7 @@ from .modelling_memo_exception import MeMoException
 import math
 
 
-#TODO: check the code where we call this!
+
 DEBUGGING = False
 
 VERBOSE = False
@@ -37,7 +37,7 @@ class MeMo(Module):
         self.device = device if device is not None else DEVICE
         
         self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, device=self.device)
-        self.layers = ModuleList([MeMoLayer(self.d, self.h, alpha=alpha_gen, compositionOp=compositionOp, is_last=(i + 1 == num_of_layers)) for i in range(num_of_layers)])
+        self.layers = ModuleList([MeMoLayer(self.d, self.h, alpha=alpha_gen, compositionOp = compositionOp, is_last=(i +1 == num_of_layers)) for i in range(num_of_layers)])
 
         self.to(self.device)
     
@@ -67,12 +67,7 @@ class MeMo(Module):
         for layer_level in range(self.l):
             if self.h ** (layer_level + 1) < current_length + 1:
                 ## update the input sequence for the next layer
-                layer_output_idxs = [
-                    i - self.h ** ((layer_level + 1) - 1) 
-                    for i in range(
-                        self.h ** (layer_level + 1), current_length + 1
-                    )
-                ]
+                layer_output_idxs = [i - self.h ** ((layer_level + 1) - 1) for i in range(self.h ** (layer_level + 1), current_length + 1)]
                 output_symbols = output_symbols[:, layer_output_idxs]
                 #print(output_symbols.shape)
                 
@@ -165,7 +160,7 @@ class MeMo(Module):
         for layer_level in range(self.l):
             current_length = int(current_length/self.h)
             input_sequence = input_sequence.reshape((batch_size, current_length, self.h, self.d))
-
+            
             input_sequence, seq_encoding_for_the_last_layer = self.layers[layer_level].retrieve(input_sequence)
             encoding_for_the_last_layer += seq_encoding_for_the_last_layer
 
