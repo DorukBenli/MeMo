@@ -187,6 +187,7 @@ class MeMo(MeMoPreTrainedModel):
                 init_weights=True,
 
                 alpha_gen=1,
+                layerized_CMM_OUT = True,
                 compositionOp=CompositionOp.Prod
         ): #, device=None):
         #super().__init__()
@@ -196,6 +197,7 @@ class MeMo(MeMoPreTrainedModel):
         self.l = num_of_layers
         self.max_len = self.h**self.l
         self.chunk_length = chunk_length
+        self.layerized_CMM_OUT = layerized_CMM_OUT
         
         if self.chunk_length/self.max_len != self.chunk_length//self.max_len:
             raise MeMoException("Chunk length "+ str(self.chunk_length) + \
@@ -204,7 +206,7 @@ class MeMo(MeMoPreTrainedModel):
         self.encoder = MeMoEmbedding(num_embeddings, self.d, padding_idx=padding_idx, init_weights=init_weights)
         self.layers = MeMoLayers(
             [
-                MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, is_last=(i+1==num_of_layers)) 
+                MeMoLayer(self.d, self.h, init_weights=init_weights, alpha=alpha_gen, compositionOp=compositionOp, layerized_CMM_OUT=self.layerized_CMM_OUT, is_last=(i+1==num_of_layers)) 
                 for i in range(num_of_layers)
             ]
         )
@@ -450,7 +452,12 @@ class MeMo(MeMoPreTrainedModel):
         
         encoding_for_the_last_layer = torch.zeros((batch_size, self.d)).to(self.device)
         current_length = self.chunk_length #min(self.chunk_length, self.max_len)
+        
+        
+        if self.layerized_CMM_OUT: 
+            residual_stream = torch.zeros((batch_size, self.d)).to(self.device)
 
+        
         # moved outside the logic for tokenization, here only assertiion above
         #if len(input_sequence) > current_length:
         #    input_sequence = input_sequence[len(input_sequence)-current_length:len(input_sequence)]
@@ -514,6 +521,11 @@ class MeMo(MeMoPreTrainedModel):
             
             sequence_representation, seq_encoding_for_the_last_layer = outputs['sequence_encoding'], outputs['token_encoding']
             encoding_for_the_last_layer += seq_encoding_for_the_last_layer
+            
+            # This is to capture the layer by layer extraction of the next token: the output of each layer is normalized in order to 
+            # penalize short sequences 
+            if self.layerized_CMM_OUT: 
+                residual_stream += outputs['layered_out_token']
 
 
         # Add last hidden state
@@ -523,7 +535,10 @@ class MeMo(MeMoPreTrainedModel):
         next_cache = next_decoder_cache if use_cache else None
 
         last_layer = self.layers[self.l-1]
-        last_token_representation = last_layer.directly_retrieve(encoding_for_the_last_layer)
+        if self.layerized_CMM_OUT: 
+            last_token_representation = residual_stream
+        else:
+            last_token_representation = last_layer.directly_retrieve(encoding_for_the_last_layer)
         
         ## the old decode step should be in the ForCausalLM pass only (and here one perform the retri)
         #retreived_output_symbol_vector, score_max = self.encoder.decode(last_token_representation)
@@ -811,6 +826,17 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
 
         total_loss = None
 
+        # Per-token statistics: {token_id: {'target_count': int, 'correct_count': int}}
+        token_stats = {}
+        
+        # Track padding tokens for masking analysis
+        pad_token_id = getattr(self.config, 'pad_token_id', 0)
+        padding_token_analysis = {
+            'padding_tokens_masked': 0,      # Padding tokens with label == -100
+            'padding_tokens_not_masked': 0,  # Padding tokens with label != -100
+            'padding_tokens_correct': 0      # Padding tokens that were correctly predicted (if not masked)
+        }
+
         for i in range(self.memo.chunk_length, labels.shape[1]):
             if outputs is not None:
                 del outputs
@@ -858,6 +884,49 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
                 # create bitmask for correctly predicted labels
                 correct_tokens = (p_indices == _labels).type(torch.int)
                 
+                # Analyze per-token statistics (before masking -100 tokens)
+                valid_mask = _labels != -100  # Tokens that are not masked
+                
+                # Flatten tensors for per-token analysis
+                flat_labels = _labels.flatten()
+                flat_correct = correct_tokens.flatten()
+                flat_valid = valid_mask.flatten()
+                
+                for token_id in torch.unique(flat_labels):
+                    token_id = token_id.item()
+                    if token_id == -100:
+                        continue
+                    
+                    # Find all occurrences of this token
+                    token_mask = (flat_labels == token_id)
+                    
+                    if token_id not in token_stats:
+                        token_stats[token_id] = {'target_count': 0, 'correct_count': 0}
+                    
+                    # Count how many times this token appears as target
+                    token_count = torch.sum(token_mask).item()
+                    token_stats[token_id]['target_count'] += token_count
+                    
+                    # Count how many times it was correctly predicted
+                    correct_for_token = torch.sum(flat_correct[token_mask]).item()
+                    token_stats[token_id]['correct_count'] += correct_for_token
+                
+                # Analyze padding tokens
+                if pad_token_id is not None:
+                    padding_mask = (flat_labels == pad_token_id)
+                    masked_padding = torch.sum((flat_labels == pad_token_id) & (_labels.flatten() == -100)).item()
+                    not_masked_padding = torch.sum((flat_labels == pad_token_id) & (_labels.flatten() != -100)).item()
+                    
+                    padding_token_analysis['padding_tokens_masked'] += masked_padding
+                    padding_token_analysis['padding_tokens_not_masked'] += not_masked_padding
+                    
+                    # Check if any unmasked padding tokens were correctly predicted
+                    if not_masked_padding > 0:
+                        unmasked_padding_correct = torch.sum(
+                            flat_correct[padding_mask & flat_valid]
+                        ).item()
+                        padding_token_analysis['padding_tokens_correct'] += unmasked_padding_correct
+                
                 # set bitmask entries to 0 for -100 tokens
                 correct_tokens[_labels == -100] = 0
                 correct_tokens = torch.sum(correct_tokens)
@@ -875,11 +944,28 @@ class MeMoForCausalLM(MeMoPreTrainedModel, GenerationMixin):
             del current_batch
             del lm_logits 
             del logits 
+
+        # # convert token_stats to list of dicts
+        # token_stats = [
+        #     {
+        #         'token_id': token_id,
+        #         'target_count': stats['target_count'],
+        #         'correct_count': stats['correct_count'],
+        #         #'accuracy': (stats['correct_count'] / stats['target_count']) if stats['target_count'] > 0 else 0.0
+        #     }
+        #     for token_id, stats in token_stats.items()
+        # ]
+        # # create two list of dictionaries from token_stats, one sorted by correct_count and one sorted by accuracy, and keep the top max_token_distrib_rank tokens for each list
+        # token_stats_by_correct = sorted(token_stats, key=lambda x: x['correct_count'], reverse=True)[:max_token_distrib_rank]
+        # token_stats_by_target = sorted(token_stats, key=lambda x: x['correct_count']/x['target_count'], reverse=True)[:max_token_distrib_rank]
+        
         # compute accuracy, and return dictionary with these fields
         accuracy_results = dict(
             accuracy=(tot_correct_tokens/total_tokens).detach().cpu().item(),
             correct_tokens=tot_correct_tokens.detach().cpu().item(),
-            tot_tokens=total_tokens.detach().cpu().item()
+            tot_tokens=total_tokens.detach().cpu().item(),
+            token_stats=token_stats,
+            padding_analysis=padding_token_analysis['padding_tokens_correct'],
         ) if compute_accuracy else None
 
         return MeMoCausalLMOutputWithPast(
