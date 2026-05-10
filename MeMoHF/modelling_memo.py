@@ -168,7 +168,11 @@ class MeMo(MeMoPreTrainedModel):
             init_weights=False, ## disable the initialization of weights from the constructor (done in the post_init)
 
             alpha_gen=config.alpha_gen,
-            compositionOp=CompositionOp.Prod if config.compositionOp=='prod' else CompositionOp.JLT #CompositionOp.Prod
+            compositionOp=(
+                CompositionOp.Prod if config.compositionOp=='prod'
+                else CompositionOp.WeightedSum if config.compositionOp=='weighted_sum'
+                else CompositionOp.JLT
+            ) #CompositionOp.Prod
         )
         
         self.gradient_checkpointing = False

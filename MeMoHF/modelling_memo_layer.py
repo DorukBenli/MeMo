@@ -195,6 +195,7 @@ from enum import Enum
 class CompositionOp(Enum):
     JLT = 1
     Prod = 2
+    WeightedSum = 3
 
 
 class MeMoLayer(Module):
@@ -215,7 +216,10 @@ class MeMoLayer(Module):
 
         self.layerized_CMM_OUT = layerized_CMM_OUT ### FMZ 2026:05:04
 
-        self.Prj = ProjectionSequence(self.d, self.d*self.h, init_weights=init_weights)
+        if compositionOp == CompositionOp.WeightedSum:
+            self.layer_mixing_logits = Parameter(torch.zeros(self.h))
+        else:
+            self.Prj = ProjectionSequence(self.d, self.d*self.h, init_weights=init_weights)
         # CMM : correlation matrix memory for the specific layer
         if self.use_local_CMM or is_last:
             self.CMM = CorrelationMatrixMemory(self.d, self.d, init_weights=init_weights)
@@ -244,7 +248,10 @@ class MeMoLayer(Module):
             sequence_encoding = F.normalize(sequence_encoding, p=2, dim=2)
         elif self.compOp == CompositionOp.JLT:
             sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
-        else: 
+        elif self.compOp == CompositionOp.WeightedSum:
+            mixing_weights = torch.softmax(self.layer_mixing_logits, dim=0)
+            sequence_encoding = (input_sequence * mixing_weights[None, None, :, None]).sum(dim=2)
+        else:
             print("ERROR")
         # sequence_encoding = self.Prj(input_sequence.reshape((batch_size, blocks, self.d * self.h)))
         # shape (blocks,self.d)
