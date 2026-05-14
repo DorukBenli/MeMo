@@ -51,6 +51,10 @@ class DualTraceMeMo(MeMo):
             compositionOp=compositionOp,
         )
 
+        # Some MeMo versions do not keep padding_idx as an exposed attribute,
+        # so store it explicitly for our padding-aware semantic mask.
+        self.padding_idx = padding_idx
+
         if context_layer_k < 1 or context_layer_k > num_of_layers:
             raise MeMoException(
                 f"context_layer_k={context_layer_k} must be in [1, {num_of_layers}]"
