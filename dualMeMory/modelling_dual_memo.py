@@ -11,17 +11,27 @@ from .semantic_store import SemanticStore
 
 
 class DualTraceMeMo(MeMo):
-    """MeMo extended with a semantic correlation-matrix memory C_sem.
+    """MeMo extended with a MeMo-native semantic memory C_sem.
 
     Everything from the original MeMo is preserved:
       - C_epi == the CMM of the LAST MeMo layer (`self.layers[-1].CMM`)
       - All MeMo write/read/forget ops work exactly as before.
 
-    The dual-trace contribution is additive:
-      - C_sem: a (d, d) zero-initialised CMM stored on `self.C_sem`.
+    The dual-trace contribution is additive and matches the architecture
+    described in CLAUDE.md:
+
+      - C_sem is a `SemanticStore` exposing two matrices,
+            C_ctx2tok  : context -> token
+            C_tok2ctx  : token   -> context
+        which are updated together every time a (context, token) pair is
+        consolidated. The two-direction storage is what turns MeMo into a
+        dual-trace associative memory: paraphrases share contexts, so their
+        `semantic_profile(token) = token_vector @ C_tok2ctx` vectors converge
+        even though their random token embeddings differ.
       - consolidate(): hook fired automatically after every memorize().
       - teach_association() / forget_association(): direct knowledge edits.
       - retrieve_semantic() / retrieve_blended() / retrieve_compositional().
+      - semantic_profile() / token_semantic_similarity(): paraphrase probes.
       - forget() generalised to a (beta_e, beta_s) policy.
     """
 
@@ -76,14 +86,20 @@ class DualTraceMeMo(MeMo):
         super().memorize(input_sequence_ids, labels_ids)
         self.consolidate(input_sequence_ids, labels_ids)
 
-    # 2.2 Consolidation: outer-product update of C_sem at layer k.
+    # 2.2 Consolidation: dual outer-product update of C_ctx2tok and C_tok2ctx
+    #     at layer k. Following CLAUDE.md, for every (context_i, token_i)
+    #     occurrence we write
+    #         C_ctx2tok += outer(context_i, token_i)
+    #         C_tok2ctx += outer(token_i, context_i)
     def consolidate(self, input_sequence_ids, labels_ids, scale: float = 1.0) -> None:
         contexts, tokens = self._layer_k_consolidation_inputs(
             input_sequence_ids, labels_ids
         )
-        self.C_sem.add_pairs(keys=contexts, values=tokens, scale=scale)
+        self.C_sem.add_pairs(contexts=contexts, tokens=tokens, scale=scale)
 
-    # 2.3 Direct association injection.
+    # 2.3 Direct association injection. `a` is treated as the context cue and
+    #     `b` as the predicted token; the symmetric tok2ctx update is added in
+    #     SemanticStore.add_association.
     def teach_association(
         self, token_a_id: int, token_b_id: int, weight: float = 1.0
     ) -> None:
@@ -99,13 +115,14 @@ class DualTraceMeMo(MeMo):
     def retrieve_episodic(self, input_sequence_ids):
         return self.retrieve(input_sequence_ids)
 
-    # 3.2 Semantic retrieval (C_sem only).
+    # 3.2 Semantic retrieval (queries C_ctx2tok only).
     def retrieve_semantic(self, input_sequence_ids):
         context_q = self._layer_k_context_query(input_sequence_ids)
         y_hat = self.C_sem(context_q)
         return self.encoder.decode(y_hat)
 
     # 3.3 Blended retrieval -- the main inference operation.
+    #     y_hat = (1 - lambda) * y_epi + lambda * y_sem
     def retrieve_blended(
         self,
         input_sequence_ids,
@@ -122,7 +139,41 @@ class DualTraceMeMo(MeMo):
         y_hat = (1 - blend_lambda) * y_epi + blend_lambda * y_sem
         return self.encoder.decode(y_hat)
 
-    # 3.4 Compositional inference over multiple input cues.
+    # 3.4 Hopfield-style attractor retrieval. The query context is iteratively
+    #     refined through C_sem so paraphrases collapse onto the same attractor
+    #     before the final token read-out.
+    def retrieve_hopfield(
+        self,
+        input_sequence_ids,
+        iterations: int = 3,
+        mode: str = "normalize",
+    ):
+        context_q = self._layer_k_context_query(input_sequence_ids)
+        y_hat = self.C_sem.hopfield_retrieve(
+            context_q, iterations=iterations, mode=mode
+        )
+        return self.encoder.decode(y_hat)
+
+    def retrieve_hopfield_blended(
+        self,
+        input_sequence_ids,
+        blend_lambda: Optional[float] = None,
+        iterations: int = 3,
+        mode: str = "normalize",
+    ):
+        if blend_lambda is None:
+            blend_lambda = self.blend_lambda
+        encoding_for_last_layer, context_q = self._dual_retrieve_encodings(
+            input_sequence_ids
+        )
+        y_epi = self.layers[self.l - 1].directly_retrieve(encoding_for_last_layer)
+        y_sem = self.C_sem.hopfield_retrieve(
+            context_q, iterations=iterations, mode=mode
+        )
+        y_hat = (1 - blend_lambda) * y_epi + blend_lambda * y_sem
+        return self.encoder.decode(y_hat)
+
+    # 3.5 Compositional inference over multiple input cues.
     def retrieve_compositional(self, queries_ids_list: Sequence):
         if len(queries_ids_list) == 0:
             raise MeMoException("retrieve_compositional needs at least one query")
@@ -134,8 +185,9 @@ class DualTraceMeMo(MeMo):
             y_hat = proj if y_hat is None else y_hat * proj
         return self.encoder.decode(y_hat)
 
-    # Token-cue variant: each cue is a single token id; query C_sem directly
-    # with the token embedding (matching the teach_association primitive).
+    # Token-cue variant: each cue is a single token id; query C_ctx2tok
+    # directly with the token embedding (matching the teach_association
+    # primitive, where the first argument is used as a context cue).
     def retrieve_compositional_from_tokens(self, token_ids: Sequence[int]):
         if len(token_ids) == 0:
             raise MeMoException(
@@ -148,11 +200,26 @@ class DualTraceMeMo(MeMo):
             y_hat = proj if y_hat is None else y_hat * proj
         return self.encoder.decode(y_hat)
 
+    # 3.6 Distributional semantic profile of a single token.
+    #     semantic_profile(t) = t_vec @ C_tok2ctx  (CLAUDE.md eq.).
+    def semantic_profile(self, token_id: int) -> Tensor:
+        t_vec = self.encoder.weight[token_id]
+        return self.C_sem.semantic_profile(t_vec)
+
+    # 3.7 Paraphrase-style similarity between two tokens, derived purely from
+    #     shared associative contexts (no external encoder).
+    def token_semantic_similarity(self, token_a_id: int, token_b_id: int) -> Tensor:
+        a_vec = self.encoder.weight[token_a_id]
+        b_vec = self.encoder.weight[token_b_id]
+        return self.C_sem.profile_similarity(a_vec, b_vec)
+
     # ------------------------------------------------------------------
     # Section 4 -- forgetting
     # ------------------------------------------------------------------
 
     # 4.1 / 4.2 Generalised forget with (beta_e, beta_s).
+    #     Semantic forgetting weakens BOTH directions of C_sem so that the
+    #     dual store stays internally consistent after the edit.
     def forget(
         self,
         input_sequence_ids,
@@ -173,7 +240,7 @@ class DualTraceMeMo(MeMo):
             contexts, tokens = self._layer_k_consolidation_inputs(
                 input_sequence_ids, labels_ids
             )
-            self.C_sem.sub_pairs(keys=contexts, values=tokens, scale=beta_s)
+            self.C_sem.sub_pairs(contexts=contexts, tokens=tokens, scale=beta_s)
 
     # 4.3 Targeted semantic forgetting (no episode required).
     def forget_association(
