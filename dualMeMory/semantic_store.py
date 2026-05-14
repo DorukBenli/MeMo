@@ -83,6 +83,10 @@ class SemanticStore(Module):
     def _pair_update(self, keys: Tensor, values: Tensor) -> Tensor:
         k = keys.reshape(-1, self.d)
         v = values.reshape(-1, self.d)
+
+        k = normalize(k, p=2, dim=-1)
+        v = normalize(v, p=2, dim=-1)
+
         return k.transpose(0, 1) @ v
 
     def add_pairs(self, contexts: Tensor, tokens: Tensor, scale: float = 1.0) -> None:
